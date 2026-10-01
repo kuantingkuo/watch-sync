@@ -1,0 +1,6 @@
+# Stable filters for watch-sync-tray.ps1.
+# If this file is changed after bisync has been initialized, run a one-time
+# bisync --resync (preferably --dry-run first) before restarting the watcher.
+
+- Thumbs.db
+- desktop.ini

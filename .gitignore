@@ -1,0 +1,20 @@
+# Per-machine configuration & state
+config.local.psd1
+watch-sync.filters.md5
+rclone.conf
+
+# Windows machine-specific launchers & shortcuts
+*.lnk
+
+# Runtime / logs / state
+*.log
+*.tmp
+*.clixml
+
+# Windows noise
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
