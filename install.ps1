@@ -189,12 +189,11 @@ foreach ($PairKey in $Config.Pairs.Keys) {
 if (-not $SkipTaskScheduler) {
     Write-Step "配置 Windows 工作排程器 (常駐背景啟動)..."
     $TaskName = "Watch-Sync-Tray"
-    $PwshExe = (Get-Command pwsh.exe).Source
-    $ScriptPath = Join-Path $PSScriptRoot "watch-sync-tray.ps1"
+    $VbsPath = Join-Path $PSScriptRoot "start-watch-sync.vbs"
 
     $Action = New-ScheduledTaskAction `
-        -Execute $PwshExe `
-        -Argument "-NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$ScriptPath`"" `
+        -Execute "wscript.exe" `
+        -Argument "`"$VbsPath`"" `
         -WorkingDirectory $PSScriptRoot
 
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
@@ -215,7 +214,7 @@ if (-not $SkipTaskScheduler) {
             -Settings $Settings `
             -Description "Watch-Sync background system tray watcher for rclone bisync" `
             -Force | Out-Null
-        Write-Success "已註冊工作排程器工作: $TaskName (使用者登入時自動以無黑窗背景啟動)"
+        Write-Success "已註冊工作排程器工作: $TaskName (透過 start-watch-sync.vbs 於使用者登入時背景無黑窗啟動)"
     }
     catch {
         Write-WarnMsg "註冊工作排程器需要適當權限。如果失敗，您亦可使用 start-watch-sync.vbs 手動啟動。錯誤訊息: $($_.Exception.Message)"
