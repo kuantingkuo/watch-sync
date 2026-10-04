@@ -147,10 +147,33 @@ if ($Config.ContainsKey("Settings") -and ($Config.Settings -is [System.Collectio
     }
 }
 
+$AllPairs = [ordered]@{}
+foreach ($PairKey in $Config.Pairs.Keys) {
+    $AllPairs[$PairKey] = $Config.Pairs[$PairKey]
+}
+
+$PairsJsonFile = Join-Path $PSScriptRoot "pairs.local.json"
+if (Test-Path -LiteralPath $PairsJsonFile -PathType Leaf) {
+    try {
+        $RawJson = Get-Content -LiteralPath $PairsJsonFile -Raw
+        $TrayPairs = ConvertFrom-Json -InputObject $RawJson -AsHashtable
+        if ($null -ne $TrayPairs) {
+            foreach ($TrayKey in $TrayPairs.Keys) {
+                if (-not $AllPairs.Contains($TrayKey)) {
+                    $AllPairs[$TrayKey] = $TrayPairs[$TrayKey]
+                }
+            }
+        }
+    }
+    catch {
+        Write-WarnMsg "讀取 pairs.local.json 失敗：$($_.Exception.Message)"
+    }
+}
+
 $AvailableRemotes = @(rclone listremotes --quiet)
 
-foreach ($PairKey in $Config.Pairs.Keys) {
-    $Pair = $Config.Pairs[$PairKey]
+foreach ($PairKey in $AllPairs.Keys) {
+    $Pair = $AllPairs[$PairKey]
     $LocalRaw = [string]$Pair.Local
     $RemoteRaw = [string]$Pair.Remote
 

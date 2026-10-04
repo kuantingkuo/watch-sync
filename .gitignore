@@ -1,5 +1,6 @@
 # Per-machine configuration & state
 config.local.psd1
+pairs.local.json
 watch-sync.filters.md5
 rclone.conf
 
