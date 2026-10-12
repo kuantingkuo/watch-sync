@@ -15,6 +15,7 @@ watch-sync/
 ├── VERSION                    # 版本號 (例如 0.2.0)
 │
 ├── watch-sync-tray.ps1        # 核心常駐程式與 Tray UI
+├── watch-sync-maintenance.ps1 # 排除規則、日誌輪替與診斷檔案清理
 ├── watch-sync.filters         # rclone bisync 過濾器規則
 ├── start-watch-sync.vbs       # 手動無黑窗背景啟動器 (VBScript)
 ├── install.ps1                # 一鍵安裝、檢查與工作排程器設定精靈
@@ -38,7 +39,7 @@ watch-sync/
    ```powershell
    winget install Microsoft.PowerShell
    ```
-3. **rclone**：
+3. **rclone 1.71+**（需要內建日誌輪替功能）：
    ```powershell
    winget install Rclone.Rclone
    ```
@@ -189,6 +190,39 @@ git pull --ff-only
   3. 這表示 rclone 成功阻擋了潛在的跨版本檔案誤刪！只要在筆電依提示執行一次 `rclone bisync ... --resync`，rclone 便會自動更新筆電本機的 `.md5`，接著點擊 Tray 的 **Restart** 即可恢復監聽。
 
 ---
+
+## 預設排除規則
+
+`watch-sync.filters` 排除 Windows/macOS 中繼資料、Office 鎖定檔、`.tmp` 暫存檔、Vim swap 檔、未完成下載、Dropbox 本機快取，以及 Python 虛擬環境與工具快取。FileSystemWatcher 使用同一份規則，這些檔案的變動不會單獨觸發同步；移入或移出排除區域的重新命名仍會觸發同步。
+
+一般 `.log`、`.bak`、Git 資料、Obsidian 設定和筆記會繼續同步。這些資料可能是工作成果或復原資訊，不能只因為檔名像暫存檔就排除。新增排除規則只會停止同步匹配項目，不會清除本機或雲端既有副本。
+
+參考：[Dropbox 不同步的檔案](https://help.dropbox.com/sync/files-not-syncing)、[OneDrive 限制](https://support.microsoft.com/en-us/onedrive/restrictions-and-limitations-in-onedrive-and-sharepoint)。更改規則後，請先預覽，再為所有配對各執行一次 `--resync`，並重啟 Watch-Sync；其他電腦拉取新規則時也需要各自更新基準。
+
+## 日誌與診斷檔案保存
+
+在系統匣選 **Open log folder** 開啟 `%LOCALAPPDATA%\rclone\watch-sync`：
+
+- `watch-sync-yyyy-MM-dd.log`：一般狀態、同步結果、錯誤及對應詳細 log 的路徑。
+- `bisync-配對名稱-識別碼-yyyy-MM-dd.log`：各配對的詳細紀錄；每組獨立輪替，避免多個 rclone 程序同時輪替同一檔案。
+- `init-時間-識別碼.log`：新增配對的初始化及預覽紀錄。
+- `.log.gz`：壓縮的舊紀錄，可用 7-Zip 等工具開啟；既有按月保存的紀錄也會壓縮並套用保存期限。
+
+預設保留最近 **30 天**，單檔達 **10 MiB** 時輪替，診斷 log 的總量目標為 **200 MiB**。容量不足時先清除較舊的紀錄，所以大量紀錄可能使可查詢期間短於 30 天。清理在啟動及每小時無同步工作時執行；當天正在使用的紀錄會保留，總量可能暫時超過目標。
+
+`%LOCALAPPDATA%\rclone\bisync` 中超過保存期限的 `*.path1.lst-dry*`、`*.path2.lst-dry*` 預覽清單會在沒有 bisync 鎖定檔時清理。正式 `.lst`、復原 `.lst-old`、未完成 `.lst-new`、鎖定檔和 filter 校驗碼會保留。使用者資料夾裡的研究 log、改名紀錄、備份，以及人工建立的復原資料夾不在自動清理範圍內。
+
+可在 `config.local.psd1` 的 `Settings` 覆蓋以下預設值：
+
+```powershell
+LogRetentionDays = 30
+LogMaxFileMiB    = 10
+LogMaxTotalMiB   = 200
+```
+
+此設計參考 [Syncthing 的 log 輪替設定](https://docs.syncthing.net/users/syncthing.html) 和 [rclone 的內建輪替與保存功能](https://rclone.org/docs/#log-file-max-size-sizesuffix)。Dropbox [每三天自動清理本機快取](https://help.dropbox.com/delete-restore/cache-folder) 是另一類暫存管理，不能套用到同步基準或使用者資料。
+
+維護功能測試：`pwsh -NoProfile -File .\tests\maintenance.tests.ps1`。測試只在自己的臨時資料夾產生檔案，並以本機 rclone 檢查排除規則。
 
 ## 安全聲明
 

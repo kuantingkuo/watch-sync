@@ -31,9 +31,25 @@ else {
 
 $LogDir = Join-Path $env:LOCALAPPDATA "rclone\watch-sync"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$LogRetentionDays = 30
+$LogMaxFileMiB = 10
+$LogMaxTotalMiB = 200
+. (Join-Path $PSScriptRoot "watch-sync-maintenance.ps1")
 
 function Get-LogFile {
-    Join-Path $LogDir ("watch-sync-{0:yyyy-MM}.log" -f (Get-Date))
+    Get-WatchSyncSummaryLogFile -LogDir $LogDir -MaxFileMiB $LogMaxFileMiB
+}
+
+function Get-RcloneLoggingArguments {
+    param([Parameter(Mandatory)][string]$LogFile)
+    @(
+        "--log-file", $LogFile
+        "--log-level", "INFO"
+        "--log-file-max-size", "${LogMaxFileMiB}M"
+        "--log-file-max-age", "${LogRetentionDays}d"
+        "--log-file-max-backups", "20"
+        "--log-file-compress"
+    )
 }
 
 function Write-Log {
@@ -130,12 +146,8 @@ $Checkers = 8
 # Keep this file present at the root of every synchronized pair on both sides.
 $CheckFileName = ".rclone-bisync-check"
 
-# Ignore these names in FileSystemWatcher so Windows metadata alone does not
-# trigger a sync. They are also excluded by watch-sync.filters.
-$WatcherIgnoreNames = @(
-    "Thumbs.db",
-    "desktop.ini"
-)
+# Derive watcher exclusions from the same filters used by rclone.
+$WatcherFilters = Get-WatchSyncWatcherFilters -FiltersFile $FiltersFile
 
 # Show a Windows notification-area icon when running interactively.
 # Launch with pwsh.exe -STA -WindowStyle Hidden to get a tray-only UI.
@@ -569,8 +581,19 @@ if ($LocalConfig.ContainsKey("Settings") -and ($LocalConfig.Settings -is [System
     if ($S.ContainsKey("Transfers")) { $Transfers = [int]$S.Transfers }
     if ($S.ContainsKey("Checkers")) { $Checkers = [int]$S.Checkers }
     if ($S.ContainsKey("CheckFileName")) { $CheckFileName = [string]$S.CheckFileName }
+    if ($S.ContainsKey("LogRetentionDays")) { $LogRetentionDays = [int]$S.LogRetentionDays }
+    if ($S.ContainsKey("LogMaxFileMiB")) { $LogMaxFileMiB = [int]$S.LogMaxFileMiB }
+    if ($S.ContainsKey("LogMaxTotalMiB")) { $LogMaxTotalMiB = [int]$S.LogMaxTotalMiB }
     if ($S.ContainsKey("EnableTrayIcon")) { $EnableTrayIcon = [bool]$S.EnableTrayIcon }
     if ($S.ContainsKey("ShowTrayErrorNotifications")) { $ShowTrayErrorNotifications = [bool]$S.ShowTrayErrorNotifications }
+}
+
+if ($LogRetentionDays -lt 1 -or $LogRetentionDays -gt 3650 -or
+    $LogMaxFileMiB -lt 1 -or $LogMaxFileMiB -gt 1024 -or
+    $LogMaxTotalMiB -lt $LogMaxFileMiB -or $LogMaxTotalMiB -gt 1048576) {
+    $LogMaxFileMiB = 10
+    Show-FatalStartupError "Log settings require retention of 1-3650 days, file sizes of 1-1024 MiB, and a total limit at least as large as one log file."
+    exit 1
 }
 
 # ----------------------------
@@ -980,29 +1003,28 @@ public static class RcloneWatcherNativeMethods
     }
 
     $script:LastLoopHeartbeat = Get-Date
+    $script:NextLogMaintenance = [datetime]::MinValue
 
     function Set-LoopHeartbeat {
         $script:LastLoopHeartbeat = Get-Date
     }
 
-    function Test-IgnoredWatcherPath {
-        param(
-            [AllowNull()]
-            [string]$FullPath
-        )
-
-        if ([string]::IsNullOrWhiteSpace($FullPath)) {
-            return $false
-        }
-
-        $Leaf = Split-Path -Path $FullPath -Leaf
-        foreach ($IgnoredName in $WatcherIgnoreNames) {
-            if ($Leaf.Equals($IgnoredName, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $true
+    function Invoke-DiagnosticMaintenance {
+        if ($script:ActiveSyncJobs.Count -gt 0 -or (Get-Date) -lt $script:NextLogMaintenance) { return }
+        $script:NextLogMaintenance = (Get-Date).AddHours(1)
+        try {
+            $ProtectedPaths = @((Get-LogFile)) + @(
+                foreach ($PairName in $Pairs.Keys) {
+                    Get-WatchSyncPairLogFile -LogDir $LogDir -PairName $PairName
+                }
+            )
+            $Result = Invoke-WatchSyncLogMaintenance -LogDir $LogDir -RetentionDays $LogRetentionDays -MaxTotalMiB $LogMaxTotalMiB -ProtectedPaths $ProtectedPaths
+            $PreviewCount = Remove-WatchSyncOldPreviews -StateDir (Join-Path $env:LOCALAPPDATA 'rclone\bisync') -RetentionDays $LogRetentionDays
+            if ($Result.Deleted -gt 0 -or $Result.Compressed -gt 0 -or $PreviewCount -gt 0) {
+                Write-Log ("Diagnostic cleanup: {0} old logs removed, {1} logs compressed, {2} old previews removed; logs use {3:N2} MiB." -f $Result.Deleted, $Result.Compressed, $PreviewCount, ($Result.TotalBytes / 1MB))
             }
         }
-
-        return $false
+        catch { Write-Log "Diagnostic cleanup deferred: $($_.Exception.Message)" "WARN" }
     }
 
     function Process-WatcherEvents {
@@ -1048,7 +1070,12 @@ public static class RcloneWatcherNativeMethods
                     $FullPath = $Event.SourceEventArgs.FullPath
                 }
 
-                if (-not (Test-IgnoredWatcherPath -FullPath $FullPath)) {
+                $Ignored = Test-WatchSyncIgnoredPath -FullPath $FullPath -LocalRoot $Pairs[$Name].Local -Filters $WatcherFilters
+                if ($EventName -eq 'Renamed' -and $null -ne $Event.SourceEventArgs) {
+                    # A rename across a filter boundary still needs synchronization.
+                    $Ignored = $Ignored -and (Test-WatchSyncIgnoredPath -FullPath $Event.SourceEventArgs.OldFullPath -LocalRoot $Pairs[$Name].Local -Filters $WatcherFilters)
+                }
+                if (-not $Ignored) {
                     $State[$Name].Dirty = $true
                     $State[$Name].LastChange = $Event.TimeGenerated
                     $State[$Name].RetryCount = 0
@@ -1165,16 +1192,14 @@ public static class RcloneWatcherNativeMethods
         $State[$Name].RetryPaused = $false
         $State[$Name].InProgress = $true
 
-        Write-Log "[$Name] bisync started ($Reason): $LocalPath <-> $RemotePath"
+        $PairLogFile = Get-WatchSyncPairLogFile -LogDir $LogDir -PairName $Name
+        Write-Log "[$Name] bisync started ($Reason): $LocalPath <-> $RemotePath. Log: $(Split-Path -Leaf $PairLogFile)"
 
         $Arguments = @(
             "bisync"
             $LocalPath
             $RemotePath
-        ) + (Get-CommonBisyncArguments) + @(
-            "--log-file", (Get-LogFile)
-            "--log-level", "INFO"
-        )
+        ) + (Get-CommonBisyncArguments) + (Get-RcloneLoggingArguments -LogFile $PairLogFile)
 
         try {
             $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1197,6 +1222,7 @@ public static class RcloneWatcherNativeMethods
                 Name    = $Name
                 Reason  = $Reason
                 Process = $Process
+                LogFile = $PairLogFile
             }
 
             $script:ActiveSyncJobs.Add($Job)
@@ -1252,6 +1278,8 @@ public static class RcloneWatcherNativeMethods
             Refresh-TrayStatus
             return $true
         }
+
+        Write-Log "[$Name] Failure details: $($Job.LogFile)" "ERROR"
 
         # rclone bisync exit 2 is a usage/configuration error. Exit 7 is a
         # critical abort that normally requires manual inspection/resync.
@@ -1482,10 +1510,7 @@ public static class RcloneWatcherNativeMethods
         }
 
         $Arguments += (Get-CommonBisyncArguments)
-        $Arguments += @(
-            "--log-file", $InitLogFile,
-            "--log-level", "INFO"
-        )
+        $Arguments += (Get-RcloneLoggingArguments -LogFile $InitLogFile)
 
         $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $StartInfo.FileName = $RcloneExe
@@ -1513,11 +1538,8 @@ public static class RcloneWatcherNativeMethods
             $LogContent = ""
             if (Test-Path -LiteralPath $InitLogFile -PathType Leaf) {
                 $LogContent = [System.IO.File]::ReadAllText($InitLogFile, [System.Text.Encoding]::UTF8)
-                if (-not [string]::IsNullOrWhiteSpace($LogContent)) {
-                    Add-Content -LiteralPath (Get-LogFile) -Value $LogContent -Encoding UTF8
-                }
-                Remove-Item -LiteralPath $InitLogFile -Force -ErrorAction SilentlyContinue
             }
+            Write-Log "Initial bisync finished (exit $ExitCode). Details: $InitLogFile"
 
             return [pscustomobject]@{
                 Success  = ($ExitCode -eq 0)
@@ -2284,6 +2306,8 @@ public static class RcloneWatcherNativeMethods
     # Startup sync
     # ----------------------------
 
+    Invoke-DiagnosticMaintenance
+
     if ($StartupDelaySeconds -gt 0) {
         Write-Log "Waiting $StartupDelaySeconds seconds before startup sync."
         Wait-Responsive -Seconds $StartupDelaySeconds
@@ -2314,6 +2338,7 @@ public static class RcloneWatcherNativeMethods
 
     while (-not $script:ExitRequested) {
         Pump-Application
+        Invoke-DiagnosticMaintenance
 
         if ($script:ExitRequested) {
             break

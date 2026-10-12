@@ -51,6 +51,11 @@
         # Transfers           = 4
         # Checkers            = 8
 
+        # 診斷日誌：保留天數、單檔輪替門檻、總容量（MiB）
+        # LogRetentionDays    = 30
+        # LogMaxFileMiB       = 10
+        # LogMaxTotalMiB      = 200
+
         # 防誤刪安全標記檔案名稱
         # CheckFileName       = ".rclone-bisync-check"
 

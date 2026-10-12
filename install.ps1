@@ -74,8 +74,18 @@ catch {
     exit 1
 }
 
+if ($RcloneVersion -match '^rclone v(\d+\.\d+\.\d+)' -and [version]$Matches[1] -lt [version]'1.71.0') {
+    Write-ErrMsg "需要 rclone 1.71 或更新版本，以支援日誌輪替。請先更新：winget upgrade Rclone.Rclone"
+    exit 1
+}
+
 # 3. 檢查必要檔案 (filters, icons, VERSION)
 Write-Step "檢查專案核心檔案與圖示..."
+$MaintenanceFile = Join-Path $PSScriptRoot "watch-sync-maintenance.ps1"
+if (-not (Test-Path -LiteralPath $MaintenanceFile -PathType Leaf)) {
+    Write-ErrMsg "缺少診斷維護程式: $MaintenanceFile"
+    exit 1
+}
 $FiltersFile = Join-Path $PSScriptRoot "watch-sync.filters"
 if (-not (Test-Path -LiteralPath $FiltersFile -PathType Leaf)) {
     Write-ErrMsg "缺少過濾器檔案: $FiltersFile"
