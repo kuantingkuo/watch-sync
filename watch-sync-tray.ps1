@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Watch-Sync: Background bi-directional file synchronization with system tray UI.
 .DESCRIPTION
@@ -26,7 +26,7 @@ $AppVersion = if (Test-Path -LiteralPath $VersionFile -PathType Leaf) {
     (Get-Content -LiteralPath $VersionFile -Raw).Trim()
 }
 else {
-    "0.2.0"
+    "unknown"
 }
 
 $LogDir = Join-Path $env:LOCALAPPDATA "rclone\watch-sync"
@@ -35,6 +35,8 @@ $LogRetentionDays = 30
 $LogMaxFileMiB = 10
 $LogMaxTotalMiB = 200
 . (Join-Path $PSScriptRoot "watch-sync-maintenance.ps1")
+. (Join-Path $PSScriptRoot "watch-sync-core.ps1")
+. (Join-Path $PSScriptRoot "watch-sync-resync.ps1")
 
 function Get-LogFile {
     Get-WatchSyncSummaryLogFile -LogDir $LogDir -MaxFileMiB $LogMaxFileMiB
@@ -57,13 +59,19 @@ function Write-Log {
         [Parameter(Mandatory)]
         [string]$Message,
 
-        [ValidateSet("INFO", "WARN", "ERROR")]
+        [ValidateSet("INFO", "WARN", "ERROR", "DEBUG")]
         [string]$Level = "INFO"
     )
 
     $Line = "{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Message
     Add-Content -LiteralPath (Get-LogFile) -Value $Line -Encoding UTF8
     Write-Host $Line
+}
+
+function Write-CleanupDiagnostic {
+    param([string]$Message)
+    try { Write-Log $Message 'DEBUG' }
+    catch { Write-Debug "Cleanup log unavailable: $Message" }
 }
 
 function Show-FatalStartupError {
@@ -85,7 +93,7 @@ function Show-FatalStartupError {
                 [System.Windows.Forms.MessageBoxIcon]::Error
             ) | Out-Null
         }
-        catch {}
+        catch { Write-CleanupDiagnostic $_.Exception.Message }
     }
 }
 
@@ -108,7 +116,7 @@ if ($IsWindows) {
 
 $FiltersFile = Join-Path $PSScriptRoot "watch-sync.filters"
 if (-not (Test-Path -LiteralPath $FiltersFile -PathType Leaf)) {
-    Show-FatalStartupError "缺少 Bisync 過濾器檔案：`n$FiltersFile"
+    Show-FatalStartupError "缺少 bisync 過濾規則檔案：`n$FiltersFile"
     exit 1
 }
 
@@ -138,6 +146,7 @@ $ResumeDelaySeconds = 10
 $StartupDelaySeconds = 3
 $RetryDelaySeconds = 120
 $MaxAutoRetries = 3
+$MaxParallelSyncs = 4
 
 # Conservative defaults for background Google Drive bisync.
 $Transfers = 4
@@ -157,215 +166,6 @@ $ShowTrayErrorNotifications = $true
 # ----------------------------
 # Path normalization and sync pair helpers
 # ----------------------------
-
-function Normalize-LocalPath {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    $Expanded = [System.Environment]::ExpandEnvironmentVariables($Path)
-    try {
-        $FullPath = [System.IO.Path]::GetFullPath($Expanded)
-        $Root = [System.IO.Path]::GetPathRoot($FullPath)
-        if ($FullPath.Length -gt $Root.Length) {
-            $FullPath = $FullPath.TrimEnd('\', '/')
-        }
-        return $FullPath.ToLowerInvariant()
-    }
-    catch {
-        return $Expanded.TrimEnd('\', '/').ToLowerInvariant()
-    }
-}
-
-function Normalize-RemotePath {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Remote
-    )
-
-    $Trimmed = $Remote.Trim()
-    $ColonIndex = $Trimmed.IndexOf(':')
-    if ($ColonIndex -lt 0) {
-        return $Trimmed.TrimEnd('/', '\').ToLowerInvariant()
-    }
-
-    $RemoteName = $Trimmed.Substring(0, $ColonIndex).Trim()
-    $SubPath = $Trimmed.Substring($ColonIndex + 1).Trim().TrimStart('/', '\').TrimEnd('/', '\')
-    $SubPath = $SubPath -replace '\\', '/'
-    while ($SubPath -match '//') {
-        $SubPath = $SubPath -replace '//', '/'
-    }
-
-    if ([string]::IsNullOrEmpty($SubPath)) {
-        return "$($RemoteName):".ToLowerInvariant()
-    }
-    return "$($RemoteName):$SubPath".ToLowerInvariant()
-}
-
-function Join-RemotePath {
-    param(
-        [Parameter(Mandatory)]
-        [string]$RemotePrefix,
-
-        [AllowEmptyString()]
-        [string]$SubPath = ""
-    )
-
-    $Prefix = $RemotePrefix.Trim()
-    $ColonIndex = $Prefix.IndexOf(':')
-    if ($ColonIndex -lt 0) {
-        $RemoteName = $Prefix
-        $RemoteSub = ""
-    }
-    else {
-        $RemoteName = $Prefix.Substring(0, $ColonIndex).Trim()
-        $RemoteSub = $Prefix.Substring($ColonIndex + 1).Trim().TrimStart('/', '\').TrimEnd('/', '\')
-    }
-
-    $Sub = if ($null -ne $SubPath) { $SubPath.Trim() } else { "" }
-    $Sub = $Sub.TrimStart('/', '\').TrimEnd('/', '\') -replace '\\', '/'
-
-    $CombinedSub = if ([string]::IsNullOrEmpty($RemoteSub)) {
-        $Sub
-    }
-    elseif ([string]::IsNullOrEmpty($Sub)) {
-        $RemoteSub
-    }
-    else {
-        "$RemoteSub/$Sub"
-    }
-
-    while ($CombinedSub -match '//') {
-        $CombinedSub = $CombinedSub -replace '//', '/'
-    }
-
-    if ([string]::IsNullOrEmpty($CombinedSub)) {
-        return "$($RemoteName):"
-    }
-    return "$($RemoteName):$CombinedSub"
-}
-
-function Get-RemoteFilePath {
-    param(
-        [Parameter(Mandatory)]
-        [string]$RemotePath,
-
-        [Parameter(Mandatory)]
-        [string]$FileName
-    )
-
-    return (Join-RemotePath -RemotePrefix $RemotePath -SubPath $FileName)
-}
-
-function Test-SyncPairConflict {
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary]$ExistingPairs,
-
-        [Parameter(Mandatory)]
-        [string]$CandidateName,
-
-        [Parameter(Mandatory)]
-        [string]$CandidateLocal,
-
-        [Parameter(Mandatory)]
-        [string]$CandidateRemote
-    )
-
-    foreach ($Name in $ExistingPairs.Keys) {
-        if ($Name.Equals($CandidateName, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{
-                HasConflict     = $true
-                ConflictType    = "Name"
-                ConflictingName = $Name
-                Message         = "Pair name '$CandidateName' is already in use by pair '$Name'."
-            }
-        }
-    }
-
-    $NormalizedCandidateLocal = Normalize-LocalPath -Path $CandidateLocal
-    foreach ($Name in $ExistingPairs.Keys) {
-        $ExistingLocal = [string]$ExistingPairs[$Name].Local
-        $NormalizedExisting = Normalize-LocalPath -Path $ExistingLocal
-        if ($NormalizedCandidateLocal -eq $NormalizedExisting) {
-            return [pscustomobject]@{
-                HasConflict     = $true
-                ConflictType    = "LocalPath"
-                ConflictingName = $Name
-                Message         = "Local folder '$CandidateLocal' is already configured by pair '$Name' ($ExistingLocal)."
-            }
-        }
-
-        if ($NormalizedCandidateLocal.StartsWith($NormalizedExisting + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{
-                HasConflict     = $true
-                ConflictType    = "LocalOverlap"
-                ConflictingName = $Name
-                Message         = "Local folder '$CandidateLocal' is inside existing pair '$Name' ($ExistingLocal). Nested folder synchronization is not allowed."
-            }
-        }
-
-        if ($NormalizedExisting.StartsWith($NormalizedCandidateLocal + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{
-                HasConflict     = $true
-                ConflictType    = "LocalOverlap"
-                ConflictingName = $Name
-                Message         = "Local folder '$CandidateLocal' contains existing pair '$Name' ($ExistingLocal). Nested folder synchronization is not allowed."
-            }
-        }
-    }
-
-    $NormalizedCandidateRemote = Normalize-RemotePath -Remote $CandidateRemote
-    foreach ($Name in $ExistingPairs.Keys) {
-        $ExistingRemote = [string]$ExistingPairs[$Name].Remote
-        $NormalizedExisting = Normalize-RemotePath -Remote $ExistingRemote
-        if ($NormalizedCandidateRemote -eq $NormalizedExisting) {
-            return [pscustomobject]@{
-                HasConflict     = $true
-                ConflictType    = "RemotePath"
-                ConflictingName = $Name
-                Message         = "Remote path '$CandidateRemote' is already configured by pair '$Name' ($ExistingRemote)."
-            }
-        }
-
-        $CandColon = $NormalizedCandidateRemote.IndexOf(':')
-        $ExistColon = $NormalizedExisting.IndexOf(':')
-        if ($CandColon -gt 0 -and $ExistColon -gt 0) {
-            $CandRemoteName = $NormalizedCandidateRemote.Substring(0, $CandColon)
-            $ExistRemoteName = $NormalizedExisting.Substring(0, $ExistColon)
-
-            if ($CandRemoteName.Equals($ExistRemoteName, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $ExistPrefix = if ($NormalizedExisting.EndsWith(':')) { $NormalizedExisting } else { $NormalizedExisting + '/' }
-                if ($NormalizedCandidateRemote.StartsWith($ExistPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    return [pscustomobject]@{
-                        HasConflict     = $true
-                        ConflictType    = "RemoteOverlap"
-                        ConflictingName = $Name
-                        Message         = "Remote path '$CandidateRemote' is inside existing pair '$Name' ($ExistingRemote) on remote '$CandRemoteName'. Nested remote path synchronization is not allowed."
-                    }
-                }
-
-                $CandPrefix = if ($NormalizedCandidateRemote.EndsWith(':')) { $NormalizedCandidateRemote } else { $NormalizedCandidateRemote + '/' }
-                if ($NormalizedExisting.StartsWith($CandPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    return [pscustomobject]@{
-                        HasConflict     = $true
-                        ConflictType    = "RemoteOverlap"
-                        ConflictingName = $Name
-                        Message         = "Remote path '$CandidateRemote' contains existing pair '$Name' ($ExistingRemote) on remote '$CandRemoteName'. Nested remote path synchronization is not allowed."
-                    }
-                }
-            }
-        }
-    }
-
-    return [pscustomobject]@{
-        HasConflict     = $false
-        ConflictType    = $null
-        ConflictingName = $null
-        Message         = $null
-    }
-}
 
 $PairsJsonFile = Join-Path $PSScriptRoot "pairs.local.json"
 
@@ -457,57 +257,18 @@ function Merge-SyncPairs {
         [System.Collections.IDictionary]$TrayPairs
     )
 
-    $Effective = [ordered]@{}
-    $script:TrayPairsStatus = [ordered]@{}
-
-    foreach ($Key in $ManualPairs.Keys) {
-        $Pair = $ManualPairs[$Key]
-        $Effective[$Key] = [ordered]@{
-            Local  = [string]$Pair.Local
-            Remote = [string]$Pair.Remote
-            Source = "config.local.psd1"
-        }
+    $Result = Resolve-SyncPairs -ManualPairs $ManualPairs -TrayPairs $TrayPairs
+    $script:TrayPairsStatus = $Result.TrayStatus
+    foreach ($Rejected in $Result.Rejected) {
+        Write-Log "Tray-managed pair [$($Rejected.Name)] rejected: $($Rejected.Message)" "WARN"
     }
-
-    foreach ($Key in $TrayPairs.Keys) {
-        $TrayPair = $TrayPairs[$Key]
-        $TrayLocal = [string]$TrayPair.Local
-        $ExpandedLocal = [System.Environment]::ExpandEnvironmentVariables($TrayLocal)
-        $TrayRemote = [string]$TrayPair.Remote
-
-        $Conflict = Test-SyncPairConflict -ExistingPairs $Effective -CandidateName $Key -CandidateLocal $ExpandedLocal -CandidateRemote $TrayRemote
-        if ($Conflict.HasConflict) {
-            Write-Log "Tray-managed pair [$Key] rejected due to conflict with [$($Conflict.ConflictingName)]: $($Conflict.Message)" "WARN"
-            $script:TrayPairsStatus[$Key] = [ordered]@{
-                IsActive = $false
-                Local    = $ExpandedLocal
-                Remote   = $TrayRemote
-                Reason   = $Conflict.Message
-            }
-            continue
-        }
-
-        $Effective[$Key] = [ordered]@{
-            Local  = $ExpandedLocal
-            Remote = $TrayRemote
-            Source = "Tray-managed"
-        }
-        $script:TrayPairsStatus[$Key] = [ordered]@{
-            IsActive = $true
-            Local    = $ExpandedLocal
-            Remote   = $TrayRemote
-            Reason   = $null
-        }
-        Write-Log "Loaded tray-managed pair: [$Key] $ExpandedLocal <-> $TrayRemote"
-    }
-
-    return $Effective
+    return $Result.Pairs
 }
 
 # Load local machine configuration
 $ConfigFile = Join-Path $PSScriptRoot "config.local.psd1"
 if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
-    Show-FatalStartupError "找不到本機設定檔：`n$ConfigFile`n`n請先複製 config.example.psd1 為 config.local.psd1 並填妥同步目錄設定。"
+    Show-FatalStartupError "找不到本機設定檔：`n$ConfigFile`n`n請將 config.example.psd1 複製為 config.local.psd1，再填入同步資料夾的設定。"
     exit 1
 }
 
@@ -520,28 +281,16 @@ catch {
 }
 
 if (-not $LocalConfig.ContainsKey("Pairs") -or -not ($LocalConfig.Pairs -is [System.Collections.IDictionary])) {
-    Show-FatalStartupError "設定檔格式錯誤：必須包含 Pairs 字典區塊。"
+    Show-FatalStartupError "設定檔格式錯誤：必須包含 Pairs 設定區塊，並以配對名稱列出 Local 與 Remote。"
     exit 1
 }
 
-$ManualPairs = [ordered]@{}
-foreach ($PairKey in $LocalConfig.Pairs.Keys) {
-    $PairData = $LocalConfig.Pairs[$PairKey]
-    if (-not $PairData.ContainsKey("Local") -or -not $PairData.ContainsKey("Remote")) {
-        Show-FatalStartupError "配對 [$PairKey] 設定不完整：必須包含 Local 與 Remote。"
-        exit 1
-    }
-
-    $RawLocal = [string]$PairData.Local
-    $RawRemote = [string]$PairData.Remote
-    $ExpandedLocal = [System.Environment]::ExpandEnvironmentVariables($RawLocal)
-
-    $ManualPairs[$PairKey] = [ordered]@{
-        Local  = $ExpandedLocal
-        Remote = $RawRemote
-        Source = "config.local.psd1"
-    }
+$ParsedPairs = ConvertTo-ManualPairs -ConfigPairs $LocalConfig.Pairs
+if ($null -ne $ParsedPairs.Error) {
+    Show-FatalStartupError $ParsedPairs.Error
+    exit 1
 }
+$ManualPairs = $ParsedPairs.Pairs
 
 # Load tray-managed pairs from pairs.local.json if it exists
 $TrayPairs = [ordered]@{}
@@ -561,40 +310,31 @@ if (Test-Path -LiteralPath $PairsJsonFile -PathType Leaf) {
                     [System.Windows.Forms.MessageBoxIcon]::Warning
                 ) | Out-Null
             }
-            catch {}
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
         }
     }
 }
 
 $Pairs = Merge-SyncPairs -ManualPairs $ManualPairs -TrayPairs $TrayPairs
 
-if ($LocalConfig.ContainsKey("Settings") -and ($LocalConfig.Settings -is [System.Collections.IDictionary])) {
-    $S = $LocalConfig.Settings
-    if ($S.ContainsKey("QuietSeconds")) { $QuietSeconds = [int]$S.QuietSeconds }
-    if ($S.ContainsKey("IdleMinutes")) { $IdleMinutes = [int]$S.IdleMinutes }
-    if ($S.ContainsKey("IdleRepeatMinutes")) { $IdleRepeatMinutes = [int]$S.IdleRepeatMinutes }
-    if ($S.ContainsKey("ResumeGapSeconds")) { $ResumeGapSeconds = [int]$S.ResumeGapSeconds }
-    if ($S.ContainsKey("ResumeDelaySeconds")) { $ResumeDelaySeconds = [int]$S.ResumeDelaySeconds }
-    if ($S.ContainsKey("StartupDelaySeconds")) { $StartupDelaySeconds = [int]$S.StartupDelaySeconds }
-    if ($S.ContainsKey("RetryDelaySeconds")) { $RetryDelaySeconds = [int]$S.RetryDelaySeconds }
-    if ($S.ContainsKey("MaxAutoRetries")) { $MaxAutoRetries = [int]$S.MaxAutoRetries }
-    if ($S.ContainsKey("Transfers")) { $Transfers = [int]$S.Transfers }
-    if ($S.ContainsKey("Checkers")) { $Checkers = [int]$S.Checkers }
-    if ($S.ContainsKey("CheckFileName")) { $CheckFileName = [string]$S.CheckFileName }
-    if ($S.ContainsKey("LogRetentionDays")) { $LogRetentionDays = [int]$S.LogRetentionDays }
-    if ($S.ContainsKey("LogMaxFileMiB")) { $LogMaxFileMiB = [int]$S.LogMaxFileMiB }
-    if ($S.ContainsKey("LogMaxTotalMiB")) { $LogMaxTotalMiB = [int]$S.LogMaxTotalMiB }
-    if ($S.ContainsKey("EnableTrayIcon")) { $EnableTrayIcon = [bool]$S.EnableTrayIcon }
-    if ($S.ContainsKey("ShowTrayErrorNotifications")) { $ShowTrayErrorNotifications = [bool]$S.ShowTrayErrorNotifications }
+$Defaults = @{}
+foreach ($Key in $script:WatchSyncSettingTypes.Keys) {
+    $Defaults[$Key] = Get-Variable -Name $Key -ValueOnly
 }
-
-if ($LogRetentionDays -lt 1 -or $LogRetentionDays -gt 3650 -or
-    $LogMaxFileMiB -lt 1 -or $LogMaxFileMiB -gt 1024 -or
-    $LogMaxTotalMiB -lt $LogMaxFileMiB -or $LogMaxTotalMiB -gt 1048576) {
-    $LogMaxFileMiB = 10
-    Show-FatalStartupError "Log settings require retention of 1-3650 days, file sizes of 1-1024 MiB, and a total limit at least as large as one log file."
+$Overrides = if ($LocalConfig.ContainsKey('Settings')) { $LocalConfig.Settings } else { $null }
+if ($null -ne $Overrides -and $Overrides -isnot [System.Collections.IDictionary]) {
+    Show-FatalStartupError 'Settings must be a dictionary.'
     exit 1
 }
+$Resolved = Resolve-WatchSyncSettings -Defaults $Defaults -Overrides $Overrides
+# The validator already returns an array; @() would wrap it in another array.
+$SettingErrors = @($Resolved.Errors) + (Test-WatchSyncSettings -Settings $Resolved.Settings)
+if ($SettingErrors.Count -gt 0) {
+    Show-FatalStartupError ($SettingErrors -join "`n")
+    exit 1
+}
+foreach ($Key in $Resolved.Settings.Keys) { Set-Variable -Name $Key -Value $Resolved.Settings[$Key] }
+foreach ($Key in $Resolved.Unknown) { Write-Log "Unknown setting ignored: $Key" 'WARN' }
 
 # ----------------------------
 # System tray UI
@@ -615,6 +355,22 @@ $script:ExitRequested = $false
 $script:ServiceReady = $false
 $script:ResumeSyncDueAt = $null
 $script:ActiveSyncJobs = [System.Collections.Generic.List[object]]::new()
+$script:SyncQueue = [ordered]@{}
+$script:RecheckRequested = $false
+$script:ResyncRequested = $false
+$script:HoldNewSyncs = $false
+$script:LastTrayStatus = $null
+$script:LastTrayState = $null
+$script:FilterBlockCheckDue = $true
+$script:NextFilterCheck = [datetime]::MinValue
+$script:FiltersHash = $null
+$script:FiltersReadError = $null
+$FiltersBaselineFile = Join-Path $LogDir 'filters-baselines.json'
+try { $script:FiltersBaselines = Get-FiltersBaselines -Path $FiltersBaselineFile }
+catch {
+    Show-FatalStartupError "Cannot read the per-pair filters baseline: $FiltersBaselineFile`n$($_.Exception.Message)"
+    exit 1
+}
 
 function Get-StateIcon {
     param(
@@ -665,7 +421,7 @@ function Get-StateIcon {
                 $script:StandbyIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($RcloneExe)
                 if ($null -ne $script:StandbyIcon) { return $script:StandbyIcon }
             }
-            catch {}
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
             return [System.Drawing.SystemIcons]::Application
         }
     }
@@ -684,6 +440,9 @@ function Set-TrayStatus {
         return
     }
 
+    if ($script:LastTrayStatus -ceq $Status -and $script:LastTrayState -eq $State) { return }
+    $script:LastTrayStatus = $Status
+    $script:LastTrayState = $State
     if ($null -ne $script:TrayStatusItem) {
         $script:TrayStatusItem.Text = "Status: $Status"
     }
@@ -697,7 +456,7 @@ function Set-TrayStatus {
     $script:TrayIcon.Icon = Get-StateIcon -State $State
 }
 
-function Refresh-TrayStatus {
+function Update-TrayStatus {
     if ($null -eq $script:TrayIcon) {
         return
     }
@@ -709,6 +468,10 @@ function Refresh-TrayStatus {
     }
 
 
+    if ($null -ne $script:FiltersReadError) {
+        Set-TrayStatus -Status 'Filters unavailable; sync paused' -State Warning
+        return
+    }
     $PairState = $StateVariable.Value
     $BlockedNames = @()
     $RetryPausedNames = @()
@@ -819,6 +582,13 @@ function Initialize-TrayIcon {
         })
     [void]$Menu.Items.Add($SyncItem)
 
+    $RecheckItem = [System.Windows.Forms.ToolStripMenuItem]::new("Recheck blocked pairs")
+    $RecheckItem.add_Click({ $script:RecheckRequested = $true })
+    [void]$Menu.Items.Add($RecheckItem)
+    $ResyncItem = [System.Windows.Forms.ToolStripMenuItem]::new("Resync...")
+    $ResyncItem.add_Click({ $script:ResyncRequested = $true })
+    [void]$Menu.Items.Add($ResyncItem)
+
     $AddItem = [System.Windows.Forms.ToolStripMenuItem]::new("Add sync folder...")
     $AddItem.add_Click({
             $script:AddPairRequested = $true
@@ -841,7 +611,7 @@ function Initialize-TrayIcon {
     $RestartItem.add_Click({
             $script:RestartRequested = $true
             $script:ExitRequested = $true
-            Refresh-TrayStatus
+            Update-TrayStatus
         })
     [void]$Menu.Items.Add($RestartItem)
 
@@ -850,7 +620,7 @@ function Initialize-TrayIcon {
     $ExitItem = [System.Windows.Forms.ToolStripMenuItem]::new("Exit")
     $ExitItem.add_Click({
             $script:ExitRequested = $true
-            Refresh-TrayStatus
+            Update-TrayStatus
         })
     [void]$Menu.Items.Add($ExitItem)
 
@@ -866,17 +636,16 @@ function Initialize-TrayIcon {
     $script:TrayMenu = $Menu
     $script:TrayStatusItem = $StatusItem
     $script:TrayIcon = $Icon
-    Refresh-TrayStatus
+    Update-TrayStatus
 }
 
-function Dispose-TrayIcon {
+function Remove-TrayIcon {
     if ($null -ne $script:TrayIcon) {
         try {
             $script:TrayIcon.Visible = $false
             $script:TrayIcon.Dispose()
         }
-        catch {
-        }
+        catch { Write-CleanupDiagnostic $_.Exception.Message }
         $script:TrayIcon = $null
     }
 
@@ -884,8 +653,7 @@ function Dispose-TrayIcon {
         try {
             $script:TrayMenu.Dispose()
         }
-        catch {
-        }
+        catch { Write-CleanupDiagnostic $_.Exception.Message }
         $script:TrayMenu = $null
     }
 
@@ -897,8 +665,7 @@ function Dispose-TrayIcon {
             try {
                 $ico.Dispose()
             }
-            catch {
-            }
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
         }
     }
     $script:StandbyIcon = $null
@@ -928,13 +695,13 @@ try {
             try {
                 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Watch-Sync 目前已經在背景執行中！`n`n狀態：正常同步監聽中`n位置：螢幕右下角系統匣（請檢查 ^ 展開圖示）",
+                    "Watch-Sync 已經在背景執行。`n`n請到螢幕右下角、時鐘旁邊的系統匣查看狀態；若沒看到圖示，點 ^ 向上箭頭展開隱藏圖示。",
                     "Watch-Sync",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information
                 ) | Out-Null
             }
-            catch {}
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
         }
         exit 0
     }
@@ -990,16 +757,7 @@ public static class RcloneWatcherNativeMethods
     $State = @{}
 
     foreach ($Name in $Pairs.Keys) {
-        $State[$Name] = [pscustomobject]@{
-            Dirty       = $false
-            LastChange  = [datetime]::MinValue
-            RetryAt     = $null
-            RetryCount  = 0
-            RetryPaused = $false
-            Blocked     = $false
-            BlockReason = $null
-            InProgress  = $false
-        }
+        $State[$Name] = New-PairState
     }
 
     $script:LastLoopHeartbeat = Get-Date
@@ -1027,7 +785,7 @@ public static class RcloneWatcherNativeMethods
         catch { Write-Log "Diagnostic cleanup deferred: $($_.Exception.Message)" "WARN" }
     }
 
-    function Process-WatcherEvents {
+    function Receive-WatcherEvents {
         # Fast check: skip pipeline overhead if no events in queue
         if ($ExecutionContext.Events.ReceivedEvents.Count -eq 0) {
             return
@@ -1057,10 +815,7 @@ public static class RcloneWatcherNativeMethods
                 }
 
                 if ($EventName -eq "Error") {
-                    $State[$Name].Dirty = $true
-                    $State[$Name].LastChange = $Event.TimeGenerated
-                    $State[$Name].RetryCount = 0
-                    $State[$Name].RetryPaused = $false
+                    Register-PairChange -State $State[$Name] -Time $Event.TimeGenerated
                     Write-Log "[$Name] FileSystemWatcher reported an error or buffer overflow; a full bisync will be triggered after the quiet period." "WARN"
                     continue
                 }
@@ -1076,10 +831,7 @@ public static class RcloneWatcherNativeMethods
                     $Ignored = $Ignored -and (Test-WatchSyncIgnoredPath -FullPath $Event.SourceEventArgs.OldFullPath -LocalRoot $Pairs[$Name].Local -Filters $WatcherFilters)
                 }
                 if (-not $Ignored) {
-                    $State[$Name].Dirty = $true
-                    $State[$Name].LastChange = $Event.TimeGenerated
-                    $State[$Name].RetryCount = 0
-                    $State[$Name].RetryPaused = $false
+                    Register-PairChange -State $State[$Name] -Time $Event.TimeGenerated
                 }
             }
             finally {
@@ -1088,12 +840,12 @@ public static class RcloneWatcherNativeMethods
         }
     }
 
-    function Pump-Application {
+    function Invoke-ApplicationPump {
         if ($null -ne $script:TrayIcon) {
             [System.Windows.Forms.Application]::DoEvents()
         }
 
-        Process-WatcherEvents
+        Receive-WatcherEvents
 
         $Now = Get-Date
         $LoopGapSeconds = ($Now - $script:LastLoopHeartbeat).TotalSeconds
@@ -1110,7 +862,7 @@ public static class RcloneWatcherNativeMethods
             $script:ResumeSyncDueAt = $Now.AddSeconds($ResumeDelaySeconds)
         }
 
-        Refresh-TrayStatus
+        Update-TrayStatus
     }
 
     function Wait-Responsive {
@@ -1121,7 +873,7 @@ public static class RcloneWatcherNativeMethods
 
         $Until = (Get-Date).AddSeconds($Seconds)
         while ((Get-Date) -lt $Until -and -not $script:ExitRequested) {
-            Pump-Application
+            Invoke-ApplicationPump
             [System.Threading.Thread]::Sleep(120)
         }
     }
@@ -1152,7 +904,7 @@ public static class RcloneWatcherNativeMethods
 
 
         if ($State[$Name].Blocked) {
-            Refresh-TrayStatus
+            Update-TrayStatus
             return $null
         }
 
@@ -1166,31 +918,24 @@ public static class RcloneWatcherNativeMethods
 
         if (-not (Test-Path -LiteralPath $LocalPath -PathType Container)) {
             Write-Log "[$Name] Local path is unavailable: $LocalPath" "ERROR"
-            $State[$Name].RetryAt = (Get-Date).AddSeconds($RetryDelaySeconds)
-            $State[$Name].RetryPaused = $false
-            Refresh-TrayStatus
+            Set-PairLocalUnavailable -State $State[$Name] -Now (Get-Date) -RetryDelaySeconds $RetryDelaySeconds
+            Update-TrayStatus
             return $null
         }
 
         $CheckPath = Join-Path $LocalPath $CheckFileName
         if (-not (Test-Path -LiteralPath $CheckPath -PathType Leaf)) {
-            $State[$Name].Blocked = $true
-            $State[$Name].BlockReason = "local safety marker missing"
-            $State[$Name].RetryAt = $null
-            $State[$Name].RetryPaused = $false
-            Write-Log "[$Name] Safety marker is missing: $CheckPath. Pair blocked until fixed and the watcher is restarted." "ERROR"
-            Refresh-TrayStatus
+            Set-PairBlocked -State $State[$Name] -Kind Marker -Reason "local safety marker missing"
+            Write-Log "[$Name] Safety marker is missing: $CheckPath. Fix the cause, then use Recheck blocked pairs." "ERROR"
+            Update-TrayStatus
             Show-TrayError -Message "$Name is blocked because its local safety marker is missing."
             return $null
         }
 
         # Clear the current dirty flag before starting. Events generated while
-        # rclone is running are still drained by Pump-Application and deliberately
+        # rclone is running are still drained by Invoke-ApplicationPump and deliberately
         # trigger one follow-up sync.
-        $State[$Name].Dirty = $false
-        $State[$Name].RetryAt = $null
-        $State[$Name].RetryPaused = $false
-        $State[$Name].InProgress = $true
+        Set-PairSyncStarted -State $State[$Name]
 
         $PairLogFile = Get-WatchSyncPairLogFile -LogDir $LogDir -PairName $Name
         Write-Log "[$Name] bisync started ($Reason): $LocalPath <-> $RemotePath. Log: $(Split-Path -Leaf $PairLogFile)"
@@ -1201,6 +946,7 @@ public static class RcloneWatcherNativeMethods
             $RemotePath
         ) + (Get-CommonBisyncArguments) + (Get-RcloneLoggingArguments -LogFile $PairLogFile)
 
+        $Process = $null
         try {
             $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
             $StartInfo.FileName = $RcloneExe
@@ -1223,25 +969,17 @@ public static class RcloneWatcherNativeMethods
                 Reason  = $Reason
                 Process = $Process
                 LogFile = $PairLogFile
+                FiltersHash = $script:FiltersHash
             }
 
             $script:ActiveSyncJobs.Add($Job)
             return $Job
         }
         catch {
-            $State[$Name].InProgress = $false
+            if ($null -ne $Process) { $Process.Dispose() }
             Write-Log "[$Name] rclone process launch error: $($_.Exception.Message)" "ERROR"
-            $State[$Name].RetryCount++
-
-            if ($State[$Name].RetryCount -le $MaxAutoRetries) {
-                $State[$Name].RetryAt = (Get-Date).AddSeconds($RetryDelaySeconds)
-                $State[$Name].RetryPaused = $false
-            }
-            else {
-                $State[$Name].RetryPaused = $true
-            }
-
-            Refresh-TrayStatus
+            Set-PairLaunchFailed -State $State[$Name] -Now (Get-Date) -RetryDelaySeconds $RetryDelaySeconds -MaxAutoRetries $MaxAutoRetries
+            Update-TrayStatus
             return $null
         }
     }
@@ -1267,125 +1005,88 @@ public static class RcloneWatcherNativeMethods
             $Process.Dispose()
         }
 
-        $State[$Name].InProgress = $false
-        Set-LoopHeartbeat
-
-        if ($ExitCode -eq 0) {
-            $State[$Name].RetryCount = 0
-            $State[$Name].RetryAt = $null
-            $State[$Name].RetryPaused = $false
-            Write-Log "[$Name] bisync completed successfully ($Reason)."
-            Refresh-TrayStatus
-            return $true
+        $Outcome = Set-PairSyncFinished -State $State[$Name] -ExitCode $ExitCode -Now (Get-Date) -RetryDelaySeconds $RetryDelaySeconds -MaxAutoRetries $MaxAutoRetries
+        switch ($Outcome.Kind) {
+            'Success' { Write-Log "[$Name] bisync completed successfully ($Reason)." }
+            'Blocked' {
+                Write-Log "[$Name] bisync blocked (exit $ExitCode). Inspect $($Job.LogFile); use Recheck blocked pairs or Resync as appropriate." 'ERROR'
+                Show-TrayError -Message "$Name was blocked by bisync (exit $ExitCode). Open the log for details."
+            }
+            'RetryScheduled' { Write-Log "[$Name] bisync failed (exit $ExitCode); retry $($Outcome.Attempt)/$MaxAutoRetries in $RetryDelaySeconds seconds. Log: $($Job.LogFile)" 'ERROR' }
+            'RetriesExhausted' {
+                Write-Log "[$Name] automatic retries paused until a new trigger. Log: $($Job.LogFile)" 'ERROR'
+                Show-TrayError -Message "$Name failed repeatedly. Automatic retries are paused until the next trigger."
+            }
         }
-
-        Write-Log "[$Name] Failure details: $($Job.LogFile)" "ERROR"
-
-        # rclone bisync exit 2 is a usage/configuration error. Exit 7 is a
-        # critical abort that normally requires manual inspection/resync.
-        # Do not create an endless retry loop for either case.
-        if ($ExitCode -eq 2 -or $ExitCode -eq 7) {
-            $State[$Name].Blocked = $true
-            $State[$Name].BlockReason = "rclone exit code $ExitCode"
-            $State[$Name].RetryAt = $null
-            $State[$Name].RetryPaused = $false
-            Write-Log "[$Name] bisync stopped with exit code $ExitCode ($Reason). Pair blocked; inspect the log and perform any required manual --resync/--force action before restarting the watcher." "ERROR"
-            Refresh-TrayStatus
-            Show-TrayError -Message "$Name was blocked by bisync (exit $ExitCode). Open the log for details."
-            return $false
-        }
-
-        $State[$Name].RetryCount++
-
-        if ($State[$Name].RetryCount -le $MaxAutoRetries) {
-            $State[$Name].RetryAt = (Get-Date).AddSeconds($RetryDelaySeconds)
-            $State[$Name].RetryPaused = $false
-            Write-Log "[$Name] bisync failed with exit code $ExitCode ($Reason). Retry $($State[$Name].RetryCount)/$MaxAutoRetries scheduled in $RetryDelaySeconds seconds." "ERROR"
-        }
-        else {
-            $State[$Name].RetryAt = $null
-            $State[$Name].RetryCount = 0
-            $State[$Name].RetryPaused = $true
-            Write-Log "[$Name] bisync failed repeatedly. Automatic retries paused until the next local-change, idle, resume, manual, or startup trigger." "ERROR"
-            Show-TrayError -Message "$Name failed repeatedly. Automatic retries are paused until the next trigger."
-        }
-
-        Refresh-TrayStatus
-        return $false
+        $script:FilterBlockCheckDue = $true
+        Update-TrayStatus
+        return ($Outcome.Kind -eq 'Success')
     }
 
-    function Invoke-PairSync {
-        param(
-            [Parameter(Mandatory)]
-            [string]$Name,
-
-            [Parameter(Mandatory)]
-            [string]$Reason
-        )
-
-        $Job = Start-PairSyncProcess -Name $Name -Reason $Reason
-        if ($null -eq $Job) {
-            return $false
-        }
-
-        Refresh-TrayStatus
-
-        while (-not $Job.Process.WaitForExit(120)) {
-            Pump-Application
-        }
-
-        $Job.Process.WaitForExit()
-        Pump-Application
-
-        return (Complete-PairSyncProcess -Job $Job)
-    }
-
-    function Invoke-AllSync {
-        param(
-            [Parameter(Mandatory)]
-            [string]$Reason
-        )
-
-        $Jobs = [System.Collections.Generic.List[object]]::new()
-
+    function Add-AllSyncRequests {
+        param([Parameter(Mandatory)][string]$Reason)
         foreach ($Name in $Pairs.Keys) {
-            if ($script:ExitRequested) {
-                break
-            }
-
-            $Job = Start-PairSyncProcess -Name $Name -Reason $Reason
-            if ($null -ne $Job) {
-                $Jobs.Add($Job)
+            if (-not $State[$Name].Blocked -and -not $State[$Name].InProgress -and -not $script:SyncQueue.Contains($Name)) {
+                $script:SyncQueue[$Name] = $Reason
             }
         }
+    }
 
-        Refresh-TrayStatus
+    function Receive-FinishedSyncs {
+        foreach ($Job in @($script:ActiveSyncJobs.ToArray())) {
+            if ($Job.Process.HasExited) { Complete-PairSyncProcess -Job $Job | Out-Null }
+        }
+    }
 
-        while ($Jobs.Count -gt 0) {
-            Pump-Application
+    function Start-DuePairSyncs {
+        if ($script:ExitRequested -or $script:HoldNewSyncs) { return }
+        Update-PairFilterBlocks
+        if ($null -ne $script:FiltersReadError) { return }
+        $Due = Select-PairsDueForSync -States $State -Queue $script:SyncQueue -Now (Get-Date) -QuietSeconds $QuietSeconds -MaxParallel $MaxParallelSyncs
+        foreach ($Name in $Due.Dropped) { $script:SyncQueue.Remove($Name) }
+        foreach ($Item in $Due.Starts) {
+            $script:SyncQueue.Remove($Item.Name)
+            Start-PairSyncProcess -Name $Item.Name -Reason $Item.Reason | Out-Null
+        }
+    }
 
-            for ($i = $Jobs.Count - 1; $i -ge 0; $i--) {
-                $Job = $Jobs[$i]
-                if ($Job.Process.WaitForExit(0)) {
-                    $Job.Process.WaitForExit()
-                    Pump-Application
-                    Complete-PairSyncProcess -Job $Job | Out-Null
-                    $Jobs.RemoveAt($i)
+    function Get-PairFilterStatus {
+        param([Parameter(Mandatory)][string]$Name)
+        if ($null -eq $script:FiltersHash) { return 'Unknown' }
+        Get-FiltersBaselineStatus -Baselines $script:FiltersBaselines -PairName $Name -Local $Pairs[$Name].Local -Remote $Pairs[$Name].Remote -CurrentHash $script:FiltersHash
+    }
+
+    function Update-PairFilterBlocks {
+        if (-not $script:FilterBlockCheckDue -and (Get-Date) -lt $script:NextFilterCheck) { return }
+        $script:NextFilterCheck = (Get-Date).AddSeconds(1)
+        $script:FilterBlockCheckDue = $false
+        try {
+            $Hash = Get-WatchSyncFiltersHash -FiltersFile $FiltersFile
+            if ($Hash -ne $script:FiltersHash -or $null -ne $script:FiltersReadError) {
+                $script:WatcherFilters = Get-WatchSyncWatcherFilters -FiltersFile $FiltersFile
+                if ($null -ne $script:FiltersHash) { Write-Log 'Filters changed; checking each pair baseline.' 'WARN' }
+                $script:FiltersHash = $Hash
+            }
+            $script:FiltersReadError = $null
+        }
+        catch {
+            if ($null -eq $script:FiltersReadError) { Write-Log "Cannot read filters; new syncs paused: $($_.Exception.Message)" 'ERROR' }
+            $script:FiltersReadError = $_.Exception.Message
+            Set-TrayStatus -Status 'Filters unavailable' -State Warning
+            return
+        }
+        foreach ($Name in $Pairs.Keys) {
+            $Status = Get-PairFilterStatus -Name $Name
+            if ($Status -ne 'Current' -and -not $State[$Name].InProgress) {
+                $Reason = if ($Status -eq 'Stale') { 'filters changed; resync required' } else { 'filter baseline not recorded; resync required' }
+                if (-not $State[$Name].Blocked -or $State[$Name].BlockReason -ne $Reason) {
+                    Set-PairBlocked -State $State[$Name] -Kind Filters -Reason $Reason
+                    Write-Log "[$Name] $Reason. Use Resync... to preview and rebuild this pair." 'WARN'
+                    Show-TrayError -Message "$Name requires a filter baseline. Use Resync..."
                 }
             }
-
-            if ($Jobs.Count -gt 0) {
-                [System.Threading.Thread]::Sleep(120)
-            }
         }
-
-        Set-LoopHeartbeat
-        Refresh-TrayStatus
     }
-
-    # ----------------------------
-    # Tray sync pair management workflows
-    # ----------------------------
 
     function Get-RcloneRemotes {
         try {
@@ -1445,7 +1146,7 @@ public static class RcloneWatcherNativeMethods
             $StderrTask = $Process.StandardError.ReadToEndAsync()
 
             while (-not $Process.WaitForExit(100)) {
-                Pump-Application
+                Invoke-ApplicationPump
             }
             $Process.WaitForExit()
 
@@ -1492,9 +1193,17 @@ public static class RcloneWatcherNativeMethods
             [Parameter(Mandatory)]
             [string]$ResyncMode,
 
-            [switch]$DryRun
+            [switch]$DryRun,
+            [string]$PairName = "",
+            [string]$ExpectedFiltersHash = "",
+            [scriptblock]$OnProgress
         )
 
+        $RunHash = Get-WatchSyncFiltersHash -FiltersFile $FiltersFile
+        if ($ExpectedFiltersHash -and $RunHash -ne $ExpectedFiltersHash) {
+            throw 'Filters changed after the preview. Run a new preview before confirming.'
+        }
+        if ($script:ExitRequested) { throw 'Exit requested; initialization canceled.' }
         $InitLogFile = Join-Path $LogDir ("init-{0:yyyyMMdd-HHmmss}-{1}.log" -f (Get-Date), [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
 
         $Arguments = @(
@@ -1511,6 +1220,7 @@ public static class RcloneWatcherNativeMethods
 
         $Arguments += (Get-CommonBisyncArguments)
         $Arguments += (Get-RcloneLoggingArguments -LogFile $InitLogFile)
+        if ($OnProgress) { $Arguments += @('--stats', '1s', '--stats-one-line', '--stats-log-level', 'INFO') }
 
         $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $StartInfo.FileName = $RcloneExe
@@ -1523,21 +1233,59 @@ public static class RcloneWatcherNativeMethods
         $Process = [System.Diagnostics.Process]::new()
         $Process.StartInfo = $StartInfo
 
+        $ProgressState = [pscustomobject]@{ Offset = 0L; Tail = ''; NextRead = [datetime]::MinValue; Disabled = $false }
+        $ElapsedWatch = [Diagnostics.Stopwatch]::StartNew()
+        $ReportProgress = {
+            param([switch]$Force)
+            if (-not $OnProgress -or $ProgressState.Disabled -or (-not $Force -and (Get-Date) -lt $ProgressState.NextRead)) { return }
+            $ProgressState.NextRead = (Get-Date).AddMilliseconds(250)
+            try {
+                $Chunk = Get-BisyncLogUpdate -Path $InitLogFile -Offset $ProgressState.Offset
+                $ProgressState.Offset = $Chunk.Offset
+                $ProgressState.Tail += $Chunk.Text
+                if ($ProgressState.Tail.Length -gt 6000) { $ProgressState.Tail = $ProgressState.Tail.Substring($ProgressState.Tail.Length - 6000) }
+                $Progress = Get-BisyncProgress -LogText $ProgressState.Tail
+                & $OnProgress ([pscustomobject]@{
+                    LogFile = $InitLogFile; Text = $Chunk.Text; Description = $Progress.Description
+                    Percent = $Progress.Percent; TransferText = $Progress.TransferText; ElapsedSeconds = $ElapsedWatch.Elapsed.TotalSeconds
+                }) | Out-Null
+            }
+            catch {
+                # A display failure must not abandon an active rclone process.
+                $ProgressState.Disabled = $true
+                Write-CleanupDiagnostic "Progress display unavailable: $($_.Exception.Message)"
+            }
+        }
+
         try {
             if (-not $Process.Start()) {
                 throw "Could not start rclone.exe"
             }
 
+            & $ReportProgress -Force
             while (-not $Process.WaitForExit(120)) {
-                Pump-Application
+                & $ReportProgress
+                Invoke-ApplicationPump
             }
             $Process.WaitForExit()
-            Pump-Application
+            Invoke-ApplicationPump
 
+            & $ReportProgress -Force
             $ExitCode = $Process.ExitCode
             $LogContent = ""
             if (Test-Path -LiteralPath $InitLogFile -PathType Leaf) {
                 $LogContent = [System.IO.File]::ReadAllText($InitLogFile, [System.Text.Encoding]::UTF8)
+            }
+            if ($ExitCode -eq 0 -and (Get-WatchSyncFiltersHash -FiltersFile $FiltersFile) -ne $RunHash) {
+                throw 'Filters changed during initialization; repeat the preview and resync.'
+            }
+            if ($ExitCode -eq 0 -and -not $DryRun -and $PairName) {
+                $NextBaselines = [ordered]@{}
+                foreach ($Key in $script:FiltersBaselines.Keys) { $NextBaselines[$Key] = $script:FiltersBaselines[$Key] }
+                Set-FiltersBaseline -Baselines $NextBaselines -PairName $PairName -Local $LocalPath -Remote $RemotePath -FiltersHash $RunHash
+                Write-FiltersBaselines -Baselines $NextBaselines -Path $FiltersBaselineFile
+                $script:FiltersBaselines = $NextBaselines
+                $script:FilterBlockCheckDue = $true
             }
             Write-Log "Initial bisync finished (exit $ExitCode). Details: $InitLogFile"
 
@@ -1545,6 +1293,8 @@ public static class RcloneWatcherNativeMethods
                 Success  = ($ExitCode -eq 0)
                 ExitCode = $ExitCode
                 Output   = $LogContent
+                FiltersHash = $RunHash
+                LogFile = $InitLogFile
             }
         }
         catch {
@@ -1553,9 +1303,11 @@ public static class RcloneWatcherNativeMethods
                 Success  = $false
                 ExitCode = -1
                 Output   = $_.Exception.Message
+                LogFile = $InitLogFile
             }
         }
         finally {
+            $ElapsedWatch.Stop()
             $Process.Dispose()
         }
     }
@@ -1794,14 +1546,20 @@ public static class RcloneWatcherNativeMethods
             [string]$RemotePath,
 
             [Parameter(Mandatory)]
-            [string]$PreferenceLabel
+            [string]$PreferenceLabel,
+
+            [string]$Header = "Initial synchronization check completed successfully.",
+
+            [string]$ActionText = "The next step will initialize rclone bisync for this pair.",
+
+            [string]$Preview = ""
         )
 
         $Font = [System.Drawing.Font]::new("Segoe UI", 9)
         $Form = [System.Windows.Forms.Form]::new()
         $Form.Font = $Font
-        $Form.Text = "Confirm Initial Synchronization - Watch-Sync"
-        $Form.ClientSize = [System.Drawing.Size]::new(520, 230)
+        $Form.Text = "Confirm Synchronization - Watch-Sync"
+        $Form.ClientSize = [System.Drawing.Size]::new(520, 330)
         $Form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
         $Form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
         $Form.MaximizeBox = $false
@@ -1809,30 +1567,36 @@ public static class RcloneWatcherNativeMethods
         $Form.TopMost = $true
 
         $LblHeader = [System.Windows.Forms.Label]::new()
-        $LblHeader.Text = "Initial synchronization check completed successfully."
+        $LblHeader.Text = $Header
         $LblHeader.Font = [System.Drawing.Font]::new("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
         $LblHeader.Location = [System.Drawing.Point]::new(20, 18)
         $LblHeader.Size = [System.Drawing.Size]::new(480, 24)
         $Form.Controls.Add($LblHeader)
 
+        $DetailsText = "Local:`t$LocalPath`r`nRemote:`t$RemotePath`r`nConflict preference:`t$PreferenceLabel`r`n`r`n$ActionText"
+        if (-not [string]::IsNullOrWhiteSpace($Preview)) {
+            $DetailsText += "`r`n`r`n$Preview"
+        }
+
         $TxtDetails = [System.Windows.Forms.TextBox]::new()
         $TxtDetails.Multiline = $true
         $TxtDetails.ReadOnly = $true
+        $TxtDetails.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
         $TxtDetails.Location = [System.Drawing.Point]::new(20, 48)
-        $TxtDetails.Size = [System.Drawing.Size]::new(480, 105)
-        $TxtDetails.Text = "Local:`t$LocalPath`r`nRemote:`t$RemotePath`r`nInitial conflict preference:`t$PreferenceLabel`r`n`r`nThe next step will initialize rclone bisync for this pair."
+        $TxtDetails.Size = [System.Drawing.Size]::new(480, 205)
+        $TxtDetails.Text = $DetailsText
         $TxtDetails.BackColor = [System.Drawing.SystemColors]::Control
         $Form.Controls.Add($TxtDetails)
 
         $BtnStart = [System.Windows.Forms.Button]::new()
-        $BtnStart.Location = [System.Drawing.Point]::new(225, 175)
+        $BtnStart.Location = [System.Drawing.Point]::new(225, 275)
         $BtnStart.Size = [System.Drawing.Size]::new(170, 32)
         $BtnStart.Text = "Start synchronization"
         $BtnStart.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $Form.Controls.Add($BtnStart)
 
         $BtnCancel = [System.Windows.Forms.Button]::new()
-        $BtnCancel.Location = [System.Drawing.Point]::new(405, 175)
+        $BtnCancel.Location = [System.Drawing.Point]::new(405, 275)
         $BtnCancel.Size = [System.Drawing.Size]::new(95, 32)
         $BtnCancel.Text = "Cancel"
         $BtnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
@@ -1890,9 +1654,9 @@ public static class RcloneWatcherNativeMethods
         Write-Log "Selected local directory: $SelectedFolder"
 
         # Check local folder conflicts and nesting early
-        $NormLocal = Normalize-LocalPath -Path $SelectedFolder
+        $NormLocal = ConvertTo-NormalizedLocalPath -Path $SelectedFolder
         foreach ($Name in $Pairs.Keys) {
-            $ExistNorm = Normalize-LocalPath -Path $Pairs[$Name].Local
+            $ExistNorm = ConvertTo-NormalizedLocalPath -Path $Pairs[$Name].Local
             if ($NormLocal -eq $ExistNorm) {
                 Write-Log "Selected directory is already configured in pair [$Name]: $SelectedFolder" "WARN"
                 [System.Windows.Forms.MessageBox]::Show(
@@ -1991,7 +1755,7 @@ public static class RcloneWatcherNativeMethods
             -ResyncMode $ResyncMode `
             -DryRun
 
-        Refresh-TrayStatus
+        Update-TrayStatus
 
         if (-not $DryRunResult.Success) {
             Write-Log "[$PairName] Initial bisync dry run failed (exit code $($DryRunResult.ExitCode))." "ERROR"
@@ -2031,9 +1795,11 @@ public static class RcloneWatcherNativeMethods
         $InitResult = Invoke-BisyncInit `
             -LocalPath $LocalPath `
             -RemotePath $RemotePath `
-            -ResyncMode $ResyncMode
+            -ResyncMode $ResyncMode `
+            -PairName $PairName `
+            -ExpectedFiltersHash $DryRunResult.FiltersHash
 
-        Refresh-TrayStatus
+        Update-TrayStatus
 
         if (-not $InitResult.Success) {
             Write-Log "[$PairName] Initial bisync failed (exit code $($InitResult.ExitCode))." "ERROR"
@@ -2086,7 +1852,7 @@ public static class RcloneWatcherNativeMethods
         Write-Log "Restart requested after adding pair '$PairName'."
         $script:RestartRequested = $true
         $script:ExitRequested = $true
-        Refresh-TrayStatus
+        Update-TrayStatus
     }
 
     function Show-ManagePairsDialog {
@@ -2254,6 +2020,121 @@ public static class RcloneWatcherNativeMethods
     }
 
     # ----------------------------
+    # Blocked pair recovery: recheck and resync
+    # ----------------------------
+
+    function Invoke-RecheckBlockedPairs {
+        $Cleared = [System.Collections.Generic.List[string]]::new()
+        $StillBlocked = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($Name in @($Pairs.Keys)) {
+            $Entry = $State[$Name]
+            if (-not $Entry.Blocked) {
+                continue
+            }
+
+            $MarkerPath = Join-Path ([string]$Pairs[$Name].Local) $CheckFileName
+            $Outcome = Get-PairRecheckOutcome `
+                -State $Entry `
+                -MarkerExists (Test-Path -LiteralPath $MarkerPath -PathType Leaf) `
+                -FilterStatus (Get-PairFilterStatus -Name $Name)
+
+            if ($Outcome.Unblock) {
+                Reset-PairBlock -State $Entry
+                $script:SyncQueue[$Name] = "recheck"
+                $Cleared.Add($Name)
+                Write-Log "[$Name] Recheck passed; block cleared and a sync is queued."
+            }
+            else {
+                $StillBlocked.Add("${Name}: $($Outcome.Reason)")
+                Write-Log "[$Name] Recheck: still blocked. $($Outcome.Reason)" "WARN"
+            }
+        }
+
+        Update-TrayStatus
+
+        if ($Cleared.Count -eq 0 -and $StillBlocked.Count -eq 0) {
+            $Message = "No sync folders are blocked."
+            $Icon = [System.Windows.Forms.MessageBoxIcon]::Information
+        }
+        else {
+            $Lines = @()
+            if ($Cleared.Count -gt 0) {
+                $Lines += "Retrying now: " + ($Cleared -join ", ")
+            }
+            if ($StillBlocked.Count -gt 0) {
+                $Lines += "Still blocked:"
+                $Lines += ($StillBlocked | ForEach-Object { "  $_" })
+                $Lines += ""
+                $Lines += "Use `"Resync...`" if the baseline must be rebuilt."
+            }
+            $Message = $Lines -join "`n"
+            $Icon = if ($StillBlocked.Count -gt 0) { [System.Windows.Forms.MessageBoxIcon]::Warning } else { [System.Windows.Forms.MessageBoxIcon]::Information }
+        }
+
+        [System.Windows.Forms.MessageBox]::Show(
+            $Message,
+            "Recheck blocked pairs - Watch-Sync",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            $Icon
+        ) | Out-Null
+    }
+
+    function Invoke-ResyncPairFlow {
+        Write-Log "Resync requested from system tray."
+        $Names = @(
+            $Pairs.Keys | Sort-Object @{ Expression = { if ($State[$_].Blocked) { 0 } else { 1 } } }, @{ Expression = { $_ } }
+        )
+        $PairInfo = [ordered]@{}
+        foreach ($Name in $Names) {
+            $FilterText = switch (Get-PairFilterStatus -Name $Name) {
+                'Current' { '符合目前的過濾規則' }
+                'Stale' { '過濾規則已改變，需要 Resync' }
+                default { '尚未記錄，需要 Resync' }
+            }
+            $StatusText = if ($State[$Name].Blocked) { "已停止同步：$($State[$Name].BlockReason)" } else { '可以正常同步' }
+            $PairInfo[$Name] = "本機：$($Pairs[$Name].Local)`r`n雲端：$($Pairs[$Name].Remote)`r`n狀態：$StatusText`r`nBaseline：$FilterText"
+        }
+        $PrepareAction = {
+            param($Choice)
+            $PairName = $Choice.Name
+            $Entry = $State[$PairName]
+            $LocalPath = [string]$Pairs[$PairName].Local
+            if ($Entry.InProgress) { throw "這個配對目前正在同步，請等同步完成。" }
+            if (-not (Test-Path -LiteralPath $LocalPath -PathType Container)) { throw "無法存取本機資料夾：$LocalPath" }
+            $MarkerPath = Join-Path $LocalPath $CheckFileName
+            if (-not (Test-Path -LiteralPath $MarkerPath -PathType Leaf)) {
+                Set-PairBlocked -State $Entry -Kind Marker -Reason 'local safety marker missing'
+                throw "缺少安全標記：$MarkerPath`n請先確認資料夾是否完整且路徑正確，再處理缺少的安全標記。"
+            }
+            return [pscustomobject]@{ Name = $PairName; Entry = $Entry; Local = $LocalPath; Remote = [string]$Pairs[$PairName].Remote; ResyncMode = $Choice.ResyncMode }
+        }
+        $RunAction = {
+            param($Prepared, [bool]$DryRun, [string]$ExpectedHash, [scriptblock]$ProgressAction)
+            $Prepared.Entry.InProgress = $true
+            try {
+                if (-not $DryRun) {
+                    $script:SyncQueue.Remove($Prepared.Name)
+                    Set-PairBlocked -State $Prepared.Entry -Kind ExitCode -Reason 'resync incomplete; inspect log and retry resync'
+                }
+                $Operation = if ($DryRun) { 'Resync preview' } else { 'Resync' }
+                Write-Log "[$($Prepared.Name)] $Operation started (--resync-mode $($Prepared.ResyncMode))."
+                Invoke-BisyncInit -LocalPath $Prepared.Local -RemotePath $Prepared.Remote -ResyncMode $Prepared.ResyncMode -DryRun:$DryRun -PairName $Prepared.Name -ExpectedFiltersHash $ExpectedHash -OnProgress $ProgressAction
+            }
+            finally { $Prepared.Entry.InProgress = $false; Update-TrayStatus }
+        }
+        $CompleteAction = {
+            param($Prepared)
+            Reset-PairBlock -State $Prepared.Entry
+            $script:FilterBlockCheckDue = $true
+            Write-Log "[$($Prepared.Name)] Resync succeeded."
+            Update-TrayStatus
+            return "本機：$($Prepared.Local)`r`n雲端：$($Prepared.Remote)`r`n狀態：可以正常同步`r`nBaseline：符合目前的過濾規則"
+        }
+        Show-ResyncWizard -PairNames $Names -PairInfo $PairInfo -PrepareAction $PrepareAction -RunAction $RunAction -CompleteAction $CompleteAction
+    }
+
+    # ----------------------------
     # Validate configuration
     # ----------------------------
 
@@ -2315,8 +2196,11 @@ public static class RcloneWatcherNativeMethods
 
     $script:ServiceReady = $true
 
+    # Block pairs whose baseline predates the current filters before anything syncs.
+    Update-PairFilterBlocks
+
     if (-not $script:ExitRequested) {
-        Invoke-AllSync -Reason "startup"
+        Add-AllSyncRequests -Reason "startup"
     }
 
     Set-LoopHeartbeat
@@ -2330,47 +2214,55 @@ public static class RcloneWatcherNativeMethods
     }
 
     Write-Log "Watcher ready. Local changes sync after $QuietSeconds quiet seconds; all pairs sync at $IdleMinutes minutes idle, every $IdleRepeatMinutes minutes during prolonged idle, and after sleep/resume detection."
-    Refresh-TrayStatus
+    Update-TrayStatus
 
     # ----------------------------
     # Main loop
     # ----------------------------
 
     while (-not $script:ExitRequested) {
-        Pump-Application
+        Invoke-ApplicationPump
+        Receive-FinishedSyncs
         Invoke-DiagnosticMaintenance
 
         if ($script:ExitRequested) {
             break
         }
 
+        Update-PairFilterBlocks
+
         if ($script:ManualSyncRequested) {
             $script:ManualSyncRequested = $false
-            Invoke-AllSync -Reason "manual tray"
-
-            if ($script:ExitRequested) {
-                break
-            }
+            Add-AllSyncRequests -Reason "manual tray"
         }
 
-        if ($script:AddPairRequested) {
+        if ($script:RecheckRequested) {
+            $script:RecheckRequested = $false
+            Invoke-RecheckBlockedPairs
+        }
+
+        # The add/manage/resync flows need a quiet system. While one is waiting,
+        # no new sync is started so the running ones drain; the request stays
+        # pending until then instead of being discarded.
+        $script:HoldNewSyncs = (
+            $script:AddPairRequested -or
+            $script:ManagePairsRequested -or
+            $script:ResyncRequested
+        )
+
+        if ($script:AddPairRequested -and $script:ActiveSyncJobs.Count -eq 0) {
             $script:AddPairRequested = $false
-            if ($script:ActiveSyncJobs.Count -gt 0) {
-                Show-TrayError -Message "A synchronization is currently in progress. Please wait for it to finish."
+            try {
+                Invoke-AddSyncPairFlow
             }
-            else {
-                try {
-                    Invoke-AddSyncPairFlow
-                }
-                catch {
-                    Write-Log "Error during Add sync folder flow: $($_.Exception.ToString())" "ERROR"
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "An error occurred while adding sync folder:`n$($_.Exception.Message)",
-                        "Watch-Sync Error",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    ) | Out-Null
-                }
+            catch {
+                Write-Log "Error during Add sync folder flow: $($_.Exception.ToString())" "ERROR"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "An error occurred while adding sync folder:`n$($_.Exception.Message)",
+                    "Watch-Sync Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
             }
 
             if ($script:ExitRequested) {
@@ -2378,24 +2270,39 @@ public static class RcloneWatcherNativeMethods
             }
         }
 
-        if ($script:ManagePairsRequested) {
+        if ($script:ManagePairsRequested -and $script:ActiveSyncJobs.Count -eq 0) {
             $script:ManagePairsRequested = $false
-            if ($script:ActiveSyncJobs.Count -gt 0) {
-                Show-TrayError -Message "A synchronization is currently in progress. Please wait for it to finish."
+            try {
+                Show-ManagePairsDialog
             }
-            else {
-                try {
-                    Show-ManagePairsDialog
-                }
-                catch {
-                    Write-Log "Error in Manage sync folders dialog: $($_.Exception.ToString())" "ERROR"
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "An error occurred in Manage sync folders dialog:`n$($_.Exception.Message)",
-                        "Watch-Sync Error",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    ) | Out-Null
-                }
+            catch {
+                Write-Log "Error in Manage sync folders dialog: $($_.Exception.ToString())" "ERROR"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "An error occurred in Manage sync folders dialog:`n$($_.Exception.Message)",
+                    "Watch-Sync Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+            }
+
+            if ($script:ExitRequested) {
+                break
+            }
+        }
+
+        if ($script:ResyncRequested -and $script:ActiveSyncJobs.Count -eq 0) {
+            $script:ResyncRequested = $false
+            try {
+                Invoke-ResyncPairFlow
+            }
+            catch {
+                Write-Log "Error during Resync flow: $($_.Exception.ToString())" "ERROR"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "An error occurred during resync:`n$($_.Exception.Message)",
+                    "Watch-Sync Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
             }
 
             if ($script:ExitRequested) {
@@ -2405,7 +2312,7 @@ public static class RcloneWatcherNativeMethods
 
         $Now = Get-Date
 
-        # A resume sync is scheduled by Pump-Application when it observes a long
+        # A resume sync is scheduled by Invoke-ApplicationPump when it observes a long
         # message-pump gap. The delay lets Wi-Fi/VPN/network state recover without
         # freezing the tray UI.
         if (
@@ -2413,7 +2320,7 @@ public static class RcloneWatcherNativeMethods
             $Now -ge $script:ResumeSyncDueAt
         ) {
             $script:ResumeSyncDueAt = $null
-            Invoke-AllSync -Reason "resume/long pause"
+            Add-AllSyncRequests -Reason "resume/long pause"
 
             $CurrentIdle = [RcloneWatcherNativeMethods]::GetIdleTime()
             if ($CurrentIdle.TotalMinutes -ge $IdleMinutes) {
@@ -2428,48 +2335,11 @@ public static class RcloneWatcherNativeMethods
             }
         }
 
-        $Now = Get-Date
-
-        # Retry only after an actual failed sync. This is not routine polling.
-        foreach ($Name in $Pairs.Keys) {
-            if ($script:ExitRequested) {
-                break
-            }
-
-            if ($State[$Name].Blocked) {
-                continue
-            }
-
-            $RetryAt = $State[$Name].RetryAt
-            if ($null -ne $RetryAt -and $Now -ge $RetryAt) {
-                Invoke-PairSync -Name $Name -Reason "retry" | Out-Null
-                $Now = Get-Date
-            }
-        }
-
-        if ($script:ExitRequested) {
-            break
-        }
-
-        # Debounced local-change sync.
-        foreach ($Name in $Pairs.Keys) {
-            if ($script:ExitRequested) {
-                break
-            }
-
-            if ($State[$Name].Blocked) {
-                continue
-            }
-
-            if (
-                $State[$Name].Dirty -and
-                $null -eq $State[$Name].RetryAt -and
-                (($Now - $State[$Name].LastChange).TotalSeconds -ge $QuietSeconds)
-            ) {
-                Invoke-PairSync -Name $Name -Reason "local change" | Out-Null
-                $Now = Get-Date
-            }
-        }
+        # Collect finished syncs, then start whatever is due (queued requests,
+        # retries after a failed sync, debounced local changes) within the
+        # MaxParallelSyncs limit. Nothing here waits for rclone.
+        Receive-FinishedSyncs
+        Start-DuePairSyncs
 
         if ($script:ExitRequested) {
             break
@@ -2496,7 +2366,7 @@ public static class RcloneWatcherNativeMethods
 
             if ($ShouldIdleSync) {
                 Write-Log ("User idle for {0:N1} minutes; syncing all pairs." -f $IdleTime.TotalMinutes)
-                Invoke-AllSync -Reason $IdleReason
+                Add-AllSyncRequests -Reason $IdleReason
                 $LastIdleSyncAt = Get-Date
             }
         }
@@ -2505,10 +2375,17 @@ public static class RcloneWatcherNativeMethods
             $LastIdleSyncAt = $null
         }
 
-        Refresh-TrayStatus
-
         # Keep the notification-area UI responsive without busy-spinning.
         [System.Threading.Thread]::Sleep(120)
+    }
+
+    # Let running syncs finish ("Exit after current sync") but start nothing new.
+    while ($script:ActiveSyncJobs.Count -gt 0) {
+        Invoke-ApplicationPump
+        Receive-FinishedSyncs
+        if ($script:ActiveSyncJobs.Count -gt 0) {
+            [System.Threading.Thread]::Sleep(120)
+        }
     }
 
     if ($script:ExitRequested) {
@@ -2516,7 +2393,7 @@ public static class RcloneWatcherNativeMethods
     }
 }
 finally {
-    Dispose-TrayIcon
+    Remove-TrayIcon
 
     if ($null -ne $script:ActiveSyncJobs) {
         foreach ($Job in @($script:ActiveSyncJobs)) {
@@ -2526,8 +2403,7 @@ finally {
                 }
                 $Job.Process.Dispose()
             }
-            catch {
-            }
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
         }
         $script:ActiveSyncJobs.Clear()
     }
@@ -2546,8 +2422,7 @@ finally {
                 $Watcher.EnableRaisingEvents = $false
                 $Watcher.Dispose()
             }
-            catch {
-            }
+            catch { Write-CleanupDiagnostic $_.Exception.Message }
         }
     }
 
@@ -2555,8 +2430,7 @@ finally {
         try {
             $Mutex.ReleaseMutex()
         }
-        catch {
-        }
+        catch { Write-CleanupDiagnostic $_.Exception.Message }
     }
 
     $Mutex.Dispose()

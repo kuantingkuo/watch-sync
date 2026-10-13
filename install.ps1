@@ -1,10 +1,10 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Watch-Sync 安裝與環境檢查部署腳本
+    Watch-Sync 安裝與環境檢查程式
 .DESCRIPTION
     檢查 PowerShell 7、rclone 環境、設定檔 config.local.psd1、
-    驗證過濾器規則與安全標記檔案，並於 Windows 工作排程器建立登入常駐工作。
+    檢查過濾規則與安全標記，並在 Windows 工作排程器建立登入時自動啟動的工作。
 .PARAMETER SkipTaskScheduler
     不自動註冊 Windows 工作排程器。
 .PARAMETER CreateDesktopShortcut
@@ -44,7 +44,7 @@ function Write-ErrMsg {
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "          Watch-Sync 安裝與環境部署精靈                  " -ForegroundColor Cyan
+Write-Host "          Watch-Sync 安裝與環境檢查                      " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. 檢查作業系統
@@ -75,30 +75,40 @@ catch {
 }
 
 if ($RcloneVersion -match '^rclone v(\d+\.\d+\.\d+)' -and [version]$Matches[1] -lt [version]'1.71.0') {
-    Write-ErrMsg "需要 rclone 1.71 或更新版本，以支援日誌輪替。請先更新：winget upgrade Rclone.Rclone"
+    Write-ErrMsg "需要 rclone 1.71 或更新版本，才能管理 log 大小與保存期限。請先更新：winget upgrade Rclone.Rclone"
     exit 1
 }
 
 # 3. 檢查必要檔案 (filters, icons, VERSION)
 Write-Step "檢查專案核心檔案與圖示..."
+$CoreFile = Join-Path $PSScriptRoot "watch-sync-core.ps1"
+if (-not (Test-Path -LiteralPath $CoreFile -PathType Leaf)) {
+    Write-ErrMsg "缺少同步核心程式: $CoreFile"
+    exit 1
+}
 $MaintenanceFile = Join-Path $PSScriptRoot "watch-sync-maintenance.ps1"
+$ResyncFile = Join-Path $PSScriptRoot "watch-sync-resync.ps1"
+if (-not (Test-Path -LiteralPath $ResyncFile -PathType Leaf)) {
+    Write-ErrMsg "缺少 Resync 視窗程式: $ResyncFile"
+    exit 1
+}
 if (-not (Test-Path -LiteralPath $MaintenanceFile -PathType Leaf)) {
-    Write-ErrMsg "缺少診斷維護程式: $MaintenanceFile"
+    Write-ErrMsg "缺少 log 管理與清理程式: $MaintenanceFile"
     exit 1
 }
 $FiltersFile = Join-Path $PSScriptRoot "watch-sync.filters"
 if (-not (Test-Path -LiteralPath $FiltersFile -PathType Leaf)) {
-    Write-ErrMsg "缺少過濾器檔案: $FiltersFile"
+    Write-ErrMsg "缺少過濾規則檔案: $FiltersFile"
     exit 1
 }
-Write-Success "過濾器規則: $FiltersFile"
+Write-Success "過濾規則: $FiltersFile"
 
 $FiltersMd5File = "$FiltersFile.md5"
 if (Test-Path -LiteralPath $FiltersMd5File -PathType Leaf) {
-    Write-Success "本機過濾器 MD5: $(Split-Path $FiltersMd5File -Leaf) (由 rclone 本機維護)"
+    Write-Success "本機過濾規則 MD5 紀錄: $(Split-Path $FiltersMd5File -Leaf) (由 rclone 管理)"
 }
 else {
-    Write-WarnMsg "本機尚未建立過濾器 MD5 快取 (初次執行 --resync 時 rclone 會自動生成)"
+    Write-WarnMsg "尚未建立過濾規則 MD5 紀錄 (第一次執行 --resync 時，rclone 會自動建立)"
 }
 
 $IconDir = Join-Path $PSScriptRoot "icons"
@@ -123,7 +133,7 @@ $ExampleConfigFile = Join-Path $PSScriptRoot "config.example.psd1"
 if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
     if (Test-Path -LiteralPath $ExampleConfigFile -PathType Leaf) {
         Copy-Item -LiteralPath $ExampleConfigFile -Destination $ConfigFile
-        Write-WarnMsg "已自範本複製建立 config.local.psd1。"
+        Write-WarnMsg "已從範本建立 config.local.psd1。"
         Write-Host "  請先以文字編輯器開啟並設定此電腦的同步目錄與 Remote：" -ForegroundColor Yellow
         Write-Host "  檔案路徑: $ConfigFile`n" -ForegroundColor Cyan
         Write-Host "  設定完成後，請重新執行 .\install.ps1 繼續完成安裝！" -ForegroundColor Cyan
@@ -144,7 +154,7 @@ catch {
 }
 
 if (-not $Config.ContainsKey("Pairs") -or -not ($Config.Pairs -is [System.Collections.IDictionary])) {
-    Write-ErrMsg "config.local.psd1 缺少 Pairs 字典區塊！"
+    Write-ErrMsg "config.local.psd1 缺少 Pairs 設定區塊，或格式不正確。"
     exit 1
 }
 
@@ -190,12 +200,12 @@ foreach ($PairKey in $AllPairs.Keys) {
     $LocalPath = [System.Environment]::ExpandEnvironmentVariables($LocalRaw)
 
     Write-Host "  -> 配對 [$PairKey]:" -ForegroundColor White
-    Write-Host "     本地: $LocalPath" -ForegroundColor DarkGray
+    Write-Host "     本機: $LocalPath" -ForegroundColor DarkGray
     Write-Host "     遠端: $RemoteRaw" -ForegroundColor DarkGray
 
-    # 檢查本地目錄
+    # 檢查本機資料夾
     if (-not (Test-Path -LiteralPath $LocalPath -PathType Container)) {
-        Write-WarnMsg "本地目錄尚未建立: $LocalPath"
+        Write-WarnMsg "本機資料夾尚未建立: $LocalPath"
     }
     else {
         # 檢查安全標記檔案
@@ -204,14 +214,14 @@ foreach ($PairKey in $AllPairs.Keys) {
             Write-Success "安全標記存在: $CheckFileName"
         }
         else {
-            Write-WarnMsg "缺少安全標記檔案: $CheckFile (請確保本地與雲端目錄皆包含此檔案以防止誤刪)"
+            Write-WarnMsg "缺少安全標記檔案: $CheckFile (本機與雲端資料夾都需要這個檔案，用來降低誤刪風險)"
         }
     }
 
     # 檢查 Remote 名稱格式
     $RemoteRoot = ($RemoteRaw -split ":")[0] + ":"
     if ($AvailableRemotes -contains $RemoteRoot) {
-        Write-Success "遠端 Remote 有效: $RemoteRoot"
+        Write-Success "已找到雲端連線 Remote: $RemoteRoot"
     }
     else {
         Write-WarnMsg "在 rclone config 中找不到 Remote: $RemoteRoot (請執行 rclone config 進行設定)"
@@ -220,7 +230,7 @@ foreach ($PairKey in $AllPairs.Keys) {
 
 # 6. 工作排程器 (Task Scheduler) 設定
 if (-not $SkipTaskScheduler) {
-    Write-Step "配置 Windows 工作排程器 (常駐背景啟動)..."
+    Write-Step "設定 Windows 工作排程器 (登入時在背景啟動)..."
     $TaskName = "Watch-Sync-Tray"
     $VbsPath = Join-Path $PSScriptRoot "start-watch-sync.vbs"
 
@@ -231,7 +241,7 @@ if (-not $SkipTaskScheduler) {
 
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
-    # 關鍵防坑設置：ExecutionTimeLimit = 0 (永不逾時終止)，電池不斷電
+    # 不限制執行時間；使用電池時也允許啟動，切換到電池時不停止程式
     $Settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -247,10 +257,10 @@ if (-not $SkipTaskScheduler) {
             -Settings $Settings `
             -Description "Watch-Sync background system tray watcher for rclone bisync" `
             -Force | Out-Null
-        Write-Success "已註冊工作排程器工作: $TaskName (透過 start-watch-sync.vbs 於使用者登入時背景無黑窗啟動)"
+        Write-Success "已建立工作排程器工作: $TaskName (登入時透過 start-watch-sync.vbs 在背景啟動，不顯示命令視窗)"
     }
     catch {
-        Write-WarnMsg "註冊工作排程器需要適當權限。如果失敗，您亦可使用 start-watch-sync.vbs 手動啟動。錯誤訊息: $($_.Exception.Message)"
+        Write-WarnMsg "建立工作排程器工作失敗。請確認帳號權限，也可以使用 start-watch-sync.vbs 手動啟動。錯誤訊息: $($_.Exception.Message)"
     }
 }
 else {
@@ -282,7 +292,7 @@ if ($CreateDesktopShortcut) {
     }
 }
 
-# 8. 檢查目前運行狀態
+# 8. 檢查程式目前是否正在執行
 Write-Step "檢查執行狀態..."
 $MutexName = "Local\RcloneSyncWatcher"
 $TestMutex = [System.Threading.Mutex]::new($false, $MutexName)
@@ -300,8 +310,8 @@ finally {
 }
 
 if ($IsRunning) {
-    Write-Success "Watch-Sync 目前正在運行中。"
-    Write-Host "  若要套用最新設定與代碼，請於系統匣圖示右鍵點選「Restart」即可！" -ForegroundColor Green
+    Write-Success "Watch-Sync 目前正在執行。"
+    Write-Host "  要套用最新設定與程式碼，請對系統匣圖示按右鍵，再選「Restart」。" -ForegroundColor Green
 }
 else {
     Write-Host "  Watch-Sync 目前尚未啟動。" -ForegroundColor Yellow
@@ -312,10 +322,10 @@ else {
         Write-Success "已透過 start-watch-sync.vbs 在背景啟動 Watch-Sync！"
     }
     else {
-        Write-Host "  您可以點擊 start-watch-sync.vbs 手動啟動，或重新登入讓排程自動啟動。" -ForegroundColor Cyan
+        Write-Host "  可以連按兩下 start-watch-sync.vbs 手動啟動，或重新登入讓工作排程器自動啟動。" -ForegroundColor Cyan
     }
 }
 
 Write-Host "`n==========================================================" -ForegroundColor Cyan
-Write-Host "                     部署完成！                           " -ForegroundColor Green
+Write-Host "                     安裝檢查完成                         " -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan
